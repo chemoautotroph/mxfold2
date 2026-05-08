@@ -5,6 +5,45 @@ import numpy as np
 from .embedding import OneHotEmbedding, SparseEmbedding
 from .transformer import TransformerLayer
 
+
+def masked_group_norm(x, weight, bias, valid_mask_spatial, num_groups, eps):
+    """GroupNorm computing mean/variance only over valid (non-pad) spatial positions.
+
+    The stock nn.GroupNorm(num_groups=1, ...) normalizes each sample across all
+    (C, *spatial) elements, including padded positions whose values can leak in
+    from earlier conv layers. This drop-in replacement skips pad positions when
+    computing statistics, so the normalized output at valid positions is the
+    same regardless of how much pad is present.
+
+    Args:
+        x: tensor of shape (B, C, *spatial) — 1D: (B, C, N); 2D: (B, C, N, N)
+        weight, bias: per-channel affine params (C,) from nn.GroupNorm
+        valid_mask_spatial: bool tensor of shape (B, *spatial), True at valid
+        num_groups: must be 1 for this implementation (matches model usage)
+        eps: small constant added to variance (matches nn.GroupNorm.eps)
+    """
+    if num_groups != 1:
+        raise NotImplementedError(
+            f"masked_group_norm only supports num_groups=1, got {num_groups}")
+    B = x.shape[0]
+    C = x.shape[1]
+    mask_expanded = valid_mask_spatial.unsqueeze(1).to(x.dtype)  # (B, 1, *spatial)
+    valid_count = mask_expanded.flatten(1).sum(dim=1)  # (B,) valid spatial positions
+    # GroupNorm with num_groups=1 normalizes across (C * spatial); same denominator C * valid_spatial
+    n_valid = (valid_count * C).clamp_min(1.0)
+    x_masked = x * mask_expanded
+    sum_x = x_masked.flatten(1).sum(dim=1)  # (B,)
+    mean = sum_x / n_valid
+    bcast_shape = (B,) + (1,) * (x.dim() - 1)
+    diff = x - mean.view(*bcast_shape)
+    diff_masked = diff * mask_expanded
+    var = (diff_masked ** 2).flatten(1).sum(dim=1) / n_valid
+    x_norm = (x - mean.view(*bcast_shape)) / torch.sqrt(var.view(*bcast_shape) + eps)
+    if weight is not None:
+        weight_shape = (1, C) + (1,) * (x.dim() - 2)
+        x_norm = x_norm * weight.view(*weight_shape) + bias.view(*weight_shape)
+    return x_norm
+
 class CNNLayer(nn.Module):
     def __init__(self, n_in, num_filters=(128,), filter_size=(7,), pool_size=(1,), dilation=1, dropout_rate=0.0, resnet=False):
         super(CNNLayer, self).__init__()
@@ -22,17 +61,33 @@ class CNNLayer(nn.Module):
 
 
     def forward(self, x, lengths=None): # x: (B, n_in, N); lengths: (B,) long or None
-        # When `lengths` is provided, pad positions are zeroed after every conv so
-        # the next conv's same-padding sees zero neighbors at the valid/pad
-        # boundary — matching the per-sequence (batch=1) computation.
+        # With `lengths`, two things happen on top of the bare batched forward:
+        #   (1) pad positions are zeroed after every conv so the next conv's
+        #       same-padding sees zero neighbors at the valid/pad boundary
+        #       (matches per-sequence behavior).
+        #   (2) GroupNorm is replaced by masked_group_norm so its mean/var are
+        #       computed only over valid spatial positions — without this the
+        #       normalization for valid positions shifts as a function of how
+        #       much pad is in the batch.
+        valid_mask_1d = None
         mask_3d = None
         if lengths is not None:
             B_, _, N_ = x.shape
-            pad_mask = torch.arange(N_, device=x.device)[None, :] >= lengths.to(x.device)[:, None]  # (B, N)
-            mask_3d = pad_mask.unsqueeze(1)  # (B, 1, N) for broadcasting over channels
+            pad_mask = torch.arange(N_, device=x.device)[None, :] >= lengths.to(x.device)[:, None]
+            valid_mask_1d = ~pad_mask  # (B, N), True at valid
+            mask_3d = pad_mask.unsqueeze(1)  # (B, 1, N) for broadcasting
             x = x.masked_fill(mask_3d, 0.0)
-        for net in self.net:
-            x_a = net(x)
+        for seq_block in self.net:
+            # seq_block is nn.Sequential(Conv1d, MaxPool1d|Identity, GroupNorm, CELU, Dropout)
+            conv, pool, norm, act, drop = seq_block[0], seq_block[1], seq_block[2], seq_block[3], seq_block[4]
+            x_a = conv(x)
+            x_a = pool(x_a)
+            if lengths is not None:
+                x_a = masked_group_norm(x_a, norm.weight, norm.bias, valid_mask_1d, norm.num_groups, norm.eps)
+            else:
+                x_a = norm(x_a)
+            x_a = act(x_a)
+            x_a = drop(x_a)
             x = x + x_a if self.resnet and x.shape[1]==x_a.shape[1] else x_a
             if mask_3d is not None:
                 x = x.masked_fill(mask_3d, 0.0)
@@ -183,39 +238,47 @@ class PairedLayer(nn.Module):
 
 
     def forward(self, x, lengths=None):
-        # When `lengths` is provided, pad positions of the 2D feature map are
-        # zeroed after every Conv2d so subsequent same-padded convs see zero
-        # neighbors at the valid/pad boundary — matching the per-sequence
-        # (batch=1) computation. The mask must be (B*2, 1, N, N) to broadcast
-        # over the doubled-batch (triu/tril concat).
+        # See CNNLayer.forward for the rationale. Same pattern but in 2D:
+        #   - mask covers (i, j) where i or j is a pad position
+        #   - GroupNorm is replaced by masked_group_norm over the 2D valid mask
+        #   - mask is duplicated along batch dim to match the triu/tril concat
         diag = 1 if self.exclude_diag else 0
         B, N, _, C = x.shape
-        # Build 2D pad mask: True wherever i is pad OR j is pad.
         mask_2d_dup = None
+        valid_mask_2d_dup = None
+        mask_2d = None
         if lengths is not None:
             pad_mask = torch.arange(N, device=x.device)[None, :] >= lengths.to(x.device)[:, None]  # (B, N)
-            mask_2d = pad_mask.unsqueeze(2) | pad_mask.unsqueeze(1)  # (B, N, N)
-            mask_2d_dup = mask_2d.repeat(2, 1, 1).unsqueeze(1)  # (B*2, 1, N, N)
+            mask_2d = pad_mask.unsqueeze(2) | pad_mask.unsqueeze(1)  # (B, N, N), True at pad
+            mask_2d_dup = mask_2d.repeat(2, 1, 1).unsqueeze(1)  # (B*2, 1, N, N) for masked_fill
+            valid_mask_2d_dup = (~mask_2d).repeat(2, 1, 1)  # (B*2, N, N) for masked_group_norm
         x = x.permute(0, 3, 1, 2)
         x_u = torch.triu(x.reshape(B*C, N, N), diagonal=diag).reshape(B, C, N, N)
         x_l = torch.tril(x.reshape(B*C, N, N), diagonal=-1).reshape(B, C, N, N)
         x = torch.cat((x_u, x_l), dim=0).reshape(B*2, C, N, N)
         if mask_2d_dup is not None:
             x = x.masked_fill(mask_2d_dup, 0.0)
-        for conv in self.conv:
+        for seq_block in self.conv:
+            # seq_block is nn.Sequential(Conv2d, GroupNorm, CELU, Dropout)
+            conv, norm, act, drop = seq_block[0], seq_block[1], seq_block[2], seq_block[3]
             x_a = conv(x)
-            x = x + x_a if self.resnet and x.shape[1]==x_a.shape[1] else x_a # (B*2, n_out, N, N)
+            if lengths is not None:
+                x_a = masked_group_norm(x_a, norm.weight, norm.bias, valid_mask_2d_dup, norm.num_groups, norm.eps)
+            else:
+                x_a = norm(x_a)
+            x_a = act(x_a)
+            x_a = drop(x_a)
+            x = x + x_a if self.resnet and x.shape[1]==x_a.shape[1] else x_a
             if mask_2d_dup is not None:
                 x = x.masked_fill(mask_2d_dup, 0.0)
-        x_u, x_l = torch.split(x, B, dim=0) # (B, n_out, N, N) * 2
+        x_u, x_l = torch.split(x, B, dim=0)
         x_u = torch.triu(x_u.reshape(B, -1, N, N), diagonal=diag)
         x_l = torch.tril(x_u.reshape(B, -1, N, N), diagonal=-1)
-        x = x_u + x_l # (B, n_out, N, N)
+        x = x_u + x_l
         x = x.permute(0, 2, 3, 1).reshape(B*N*N, -1)
         x = self.fc(x)
-        out = x.reshape(B, N, N, -1) # (B, N, N, n_out)
+        out = x.reshape(B, N, N, -1)
         if lengths is not None:
-            # Reuse the (B, N, N) pad mask for the final output too.
             out = out.masked_fill(mask_2d.unsqueeze(-1), 0.0)
         return out
 
@@ -251,23 +314,33 @@ class UnpairedLayer(nn.Module):
 
 
     def forward(self, x, x_base=None, lengths=None):
-        # 1D analogue of PairedLayer's masking — zero pad positions after every
-        # Conv1d so subsequent same-padded convs see zero neighbors at the
-        # valid/pad boundary.
+        # 1D analogue of PairedLayer's masked path: pad-zero between convs and
+        # use masked_group_norm for the GroupNorm step.
         B, N, C = x.shape
+        valid_mask_1d = None
         mask_3d = None
+        pad_mask = None
         if lengths is not None:
-            pad_mask = torch.arange(N, device=x.device)[None, :] >= lengths.to(x.device)[:, None]  # (B, N)
-            mask_3d = pad_mask.unsqueeze(1)  # (B, 1, N)
+            pad_mask = torch.arange(N, device=x.device)[None, :] >= lengths.to(x.device)[:, None]
+            valid_mask_1d = ~pad_mask
+            mask_3d = pad_mask.unsqueeze(1)
         x = x.transpose(1, 2) # (B, n_in, N)
         if mask_3d is not None:
             x = x.masked_fill(mask_3d, 0.0)
-        for conv in self.conv:
+        for seq_block in self.conv:
+            # seq_block is nn.Sequential(Conv1d, GroupNorm, CELU, Dropout)
+            conv, norm, act, drop = seq_block[0], seq_block[1], seq_block[2], seq_block[3]
             x_a = conv(x)
+            if lengths is not None:
+                x_a = masked_group_norm(x_a, norm.weight, norm.bias, valid_mask_1d, norm.num_groups, norm.eps)
+            else:
+                x_a = norm(x_a)
+            x_a = act(x_a)
+            x_a = drop(x_a)
             x = x + x_a if self.resnet and x.shape[1]==x_a.shape[1] else x_a
             if mask_3d is not None:
                 x = x.masked_fill(mask_3d, 0.0)
-        x = x.transpose(1, 2).reshape(B*N, -1) # (B, N, n_out)
+        x = x.transpose(1, 2).reshape(B*N, -1)
         x = self.fc(x)
         out = x.reshape(B, N, -1)
         if lengths is not None:
