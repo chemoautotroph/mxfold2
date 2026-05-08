@@ -437,11 +437,18 @@ class NeuralNet(nn.Module):
         # right-pads to max length. Lengths after the '0' prefix tell the encoder
         # where each sequence ends so LSTM / attention can mask the pad tail.
         prefixed = ['0' + s for s in seq]
-        lengths = torch.tensor([len(s) for s in prefixed], dtype=torch.long, device=device)
+        raw_lengths = [len(s) for s in prefixed]
         x = self.embedding(prefixed).to(device) # (B, 4, N_padded)
-        # OneHotEmbedding adds 'n' on both sides of length ksize//2, accounting for that:
-        if isinstance(self.embedding, OneHotEmbedding):
-            lengths = lengths + 2 * (self.embedding.ksize // 2)
+        # If every sequence is the same length, there is no padding to mask;
+        # skipping the lengths threading avoids per-layer masked_fill overhead
+        # (which becomes significant on small models like MXFold2's MixC).
+        if len(set(raw_lengths)) == 1:
+            lengths = None
+        else:
+            lengths = torch.tensor(raw_lengths, dtype=torch.long, device=device)
+            # OneHotEmbedding adds 'n' on both sides of length ksize//2:
+            if isinstance(self.embedding, OneHotEmbedding):
+                lengths = lengths + 2 * (self.embedding.ksize // 2)
         x = self.encoder(x, lengths=lengths)
 
         if self.no_split_lr:
