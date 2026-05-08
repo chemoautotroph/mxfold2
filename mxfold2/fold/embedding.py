@@ -45,6 +45,11 @@ class SparseEmbedding(nn.Module):
 
 
     def __call__(self, seq):
+        # Right-pad each sequence to the longest in the batch with '0' (vocab idx 0,
+        # which is padding_idx for self.embedding so its embedding is fixed at zero).
+        # Without this, LongTensor() fails on unequal-length rows when batch_size>1.
+        max_len = max(len(s) for s in seq)
+        seq = [s + '0' * (max_len - len(s)) for s in seq]
         seq = torch.LongTensor([[self.vocb[c] for c in s.lower()] for s in seq])
         seq = seq.to(self.embedding.weight.device)
         return self.embedding(seq).transpose(1, 2)

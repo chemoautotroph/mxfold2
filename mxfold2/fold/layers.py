@@ -21,10 +21,21 @@ class CNNLayer(nn.Module):
             n_in = n_out
 
 
-    def forward(self, x): # (B=1, 4, N)
+    def forward(self, x, lengths=None): # x: (B, n_in, N); lengths: (B,) long or None
+        # When `lengths` is provided, pad positions are zeroed after every conv so
+        # the next conv's same-padding sees zero neighbors at the valid/pad
+        # boundary — matching the per-sequence (batch=1) computation.
+        mask_3d = None
+        if lengths is not None:
+            B_, _, N_ = x.shape
+            pad_mask = torch.arange(N_, device=x.device)[None, :] >= lengths.to(x.device)[:, None]  # (B, N)
+            mask_3d = pad_mask.unsqueeze(1)  # (B, 1, N) for broadcasting over channels
+            x = x.masked_fill(mask_3d, 0.0)
         for net in self.net:
             x_a = net(x)
             x = x + x_a if self.resnet and x.shape[1]==x_a.shape[1] else x_a
+            if mask_3d is not None:
+                x = x.masked_fill(mask_3d, 0.0)
         return x
 
 
@@ -60,22 +71,61 @@ class CNNLSTMEncoder(nn.Module):
             self.att = nn.MultiheadAttention(self.n_out, num_att, dropout=dropout_rate)
 
 
-    def forward(self, x): # (B, n_in, N)
+    def forward(self, x, lengths=None): # x: (B, n_in, N); lengths: (B,) long or None
+        # When `lengths` is provided, batch-pad-aware masking is applied so that
+        # batched output matches per-sequence (batch=1) output at valid positions.
+        # Specifically:
+        #   - LSTM uses pack_padded_sequence so the backward direction does not
+        #     start from a tail of pad-zero inputs and pollute every position.
+        #   - MultiheadAttention uses key_padding_mask so pad keys are ignored.
+        #   - Final output has pad rows zeroed so downstream layers (Transform2D,
+        #     PairedLayer/UnpairedLayer with same-padded conv) see clean inputs.
+        # When `lengths` is None, behavior is identical to upstream (batch=1 only).
         if self.conv is not None:
-            x = self.conv(x) # (B, C, N)
+            x = self.conv(x, lengths=lengths) # (B, C, N)
         x = torch.transpose(x, 1, 2) # (B, N, C)
 
+        pad_mask = None  # (B, N) bool, True at pad positions
+        if lengths is not None:
+            B_, N_, _ = x.shape
+            if int(lengths.max()) > N_:
+                raise RuntimeError(f"max length {int(lengths.max())} > padded N {N_}")
+            arange = torch.arange(N_, device=x.device)
+            pad_mask = arange[None, :] >= lengths.to(x.device)[:, None]
+
         if self.lstm is not None:
-            x_a, _ = self.lstm(x)
+            # Skip pack/pad when no actual padding exists (lengths all equal to N).
+            # pack_padded_sequence reorders internally and can produce slightly
+            # different numerical results vs the direct path; for same-length
+            # batches we want to be bit-identical to batch=1.
+            if lengths is not None and not torch.all(lengths == x.shape[1]):
+                packed = nn.utils.rnn.pack_padded_sequence(
+                    x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+                x_a_packed, _ = self.lstm(packed)
+                x_a, _ = nn.utils.rnn.pad_packed_sequence(
+                    x_a_packed, batch_first=True, total_length=x.shape[1])
+            else:
+                x_a, _ = self.lstm(x)
             x_a = self.lstm_ln(x_a)
             x_a = self.dropout(F.celu(x_a)) # (B, N, H*2)
             x = x + x_a if self.resnet and x.shape[2]==x_a.shape[2] else x_a
 
         if self.att is not None:
-            x = torch.transpose(x, 0, 1)
-            x_a, _ = self.att(x, x, x)
-            x = x + x_a
-            x = torch.transpose(x, 0, 1)
+            x_nbc = torch.transpose(x, 0, 1)  # (N, B, C) — MHA default layout
+            if pad_mask is not None:
+                x_a, _ = self.att(x_nbc, x_nbc, x_nbc, key_padding_mask=pad_mask)
+                # Pad-row queries attend to *some* unmasked keys but their own
+                # query vector and the resulting outputs may still be NaN/garbage
+                # depending on torch version; zero them explicitly. Mask shape
+                # (B, N) → (N, B, 1) for broadcasting against x_a.
+                x_a = x_a.masked_fill(pad_mask.t().unsqueeze(-1), 0.0)
+            else:
+                x_a, _ = self.att(x_nbc, x_nbc, x_nbc)
+            x = x_nbc + x_a
+            x = torch.transpose(x, 0, 1)  # back to (B, N, C)
+
+        if pad_mask is not None:
+            x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
         return x
 
@@ -89,8 +139,8 @@ class Transform2D(nn.Module):
     def forward(self, x_l, x_r):
         assert(x_l.shape == x_r.shape)
         B, N, C = x_l.shape
-        x_l = x_l.view(B, N, 1, C).expand(B, N, N, C)
-        x_r = x_r.view(B, 1, N, C).expand(B, N, N, C)
+        x_l = x_l.reshape(B, N, 1, C).expand(B, N, N, C)
+        x_r = x_r.reshape(B, 1, N, C).expand(B, N, N, C)
         if self.join=='cat':
             x = torch.cat((x_l, x_r), dim=3) # (B, N, N, C*2)
         elif self.join=='add':
@@ -132,23 +182,42 @@ class PairedLayer(nn.Module):
         self.fc = nn.Sequential(*fc)
 
 
-    def forward(self, x):
+    def forward(self, x, lengths=None):
+        # When `lengths` is provided, pad positions of the 2D feature map are
+        # zeroed after every Conv2d so subsequent same-padded convs see zero
+        # neighbors at the valid/pad boundary — matching the per-sequence
+        # (batch=1) computation. The mask must be (B*2, 1, N, N) to broadcast
+        # over the doubled-batch (triu/tril concat).
         diag = 1 if self.exclude_diag else 0
         B, N, _, C = x.shape
+        # Build 2D pad mask: True wherever i is pad OR j is pad.
+        mask_2d_dup = None
+        if lengths is not None:
+            pad_mask = torch.arange(N, device=x.device)[None, :] >= lengths.to(x.device)[:, None]  # (B, N)
+            mask_2d = pad_mask.unsqueeze(2) | pad_mask.unsqueeze(1)  # (B, N, N)
+            mask_2d_dup = mask_2d.repeat(2, 1, 1).unsqueeze(1)  # (B*2, 1, N, N)
         x = x.permute(0, 3, 1, 2)
-        x_u = torch.triu(x.view(B*C, N, N), diagonal=diag).view(B, C, N, N)
-        x_l = torch.tril(x.view(B*C, N, N), diagonal=-1).view(B, C, N, N)
-        x = torch.cat((x_u, x_l), dim=0).view(B*2, C, N, N)
+        x_u = torch.triu(x.reshape(B*C, N, N), diagonal=diag).reshape(B, C, N, N)
+        x_l = torch.tril(x.reshape(B*C, N, N), diagonal=-1).reshape(B, C, N, N)
+        x = torch.cat((x_u, x_l), dim=0).reshape(B*2, C, N, N)
+        if mask_2d_dup is not None:
+            x = x.masked_fill(mask_2d_dup, 0.0)
         for conv in self.conv:
             x_a = conv(x)
             x = x + x_a if self.resnet and x.shape[1]==x_a.shape[1] else x_a # (B*2, n_out, N, N)
+            if mask_2d_dup is not None:
+                x = x.masked_fill(mask_2d_dup, 0.0)
         x_u, x_l = torch.split(x, B, dim=0) # (B, n_out, N, N) * 2
-        x_u = torch.triu(x_u.view(B, -1, N, N), diagonal=diag)
-        x_l = torch.tril(x_u.view(B, -1, N, N), diagonal=-1)
+        x_u = torch.triu(x_u.reshape(B, -1, N, N), diagonal=diag)
+        x_l = torch.tril(x_u.reshape(B, -1, N, N), diagonal=-1)
         x = x_u + x_l # (B, n_out, N, N)
-        x = x.permute(0, 2, 3, 1).view(B*N*N, -1)
+        x = x.permute(0, 2, 3, 1).reshape(B*N*N, -1)
         x = self.fc(x)
-        return x.view(B, N, N, -1) # (B, N, N, n_out)
+        out = x.reshape(B, N, N, -1) # (B, N, N, n_out)
+        if lengths is not None:
+            # Reuse the (B, N, N) pad mask for the final output too.
+            out = out.masked_fill(mask_2d.unsqueeze(-1), 0.0)
+        return out
 
 
 class UnpairedLayer(nn.Module):
@@ -181,15 +250,29 @@ class UnpairedLayer(nn.Module):
         self.fc = nn.Sequential(*fc)
 
 
-    def forward(self, x, x_base=None):
+    def forward(self, x, x_base=None, lengths=None):
+        # 1D analogue of PairedLayer's masking — zero pad positions after every
+        # Conv1d so subsequent same-padded convs see zero neighbors at the
+        # valid/pad boundary.
         B, N, C = x.shape
+        mask_3d = None
+        if lengths is not None:
+            pad_mask = torch.arange(N, device=x.device)[None, :] >= lengths.to(x.device)[:, None]  # (B, N)
+            mask_3d = pad_mask.unsqueeze(1)  # (B, 1, N)
         x = x.transpose(1, 2) # (B, n_in, N)
+        if mask_3d is not None:
+            x = x.masked_fill(mask_3d, 0.0)
         for conv in self.conv:
             x_a = conv(x)
             x = x + x_a if self.resnet and x.shape[1]==x_a.shape[1] else x_a
-        x = x.transpose(1, 2).view(B*N, -1) # (B, N, n_out)
+            if mask_3d is not None:
+                x = x.masked_fill(mask_3d, 0.0)
+        x = x.transpose(1, 2).reshape(B*N, -1) # (B, N, n_out)
         x = self.fc(x)
-        return x.view(B, N, -1)
+        out = x.reshape(B, N, -1)
+        if lengths is not None:
+            out = out.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        return out
 
 
 class LengthLayer(nn.Module):
@@ -277,8 +360,16 @@ class NeuralNet(nn.Module):
 
     def forward(self, seq):
         device = next(self.parameters()).device
-        x = self.embedding(['0' + s for s in seq]).to(device) # (B, 4, N)
-        x = self.encoder(x)
+        # Each input gets a leading '0' token (zero-vec marker), then the embedding
+        # right-pads to max length. Lengths after the '0' prefix tell the encoder
+        # where each sequence ends so LSTM / attention can mask the pad tail.
+        prefixed = ['0' + s for s in seq]
+        lengths = torch.tensor([len(s) for s in prefixed], dtype=torch.long, device=device)
+        x = self.embedding(prefixed).to(device) # (B, 4, N_padded)
+        # OneHotEmbedding adds 'n' on both sides of length ksize//2, accounting for that:
+        if isinstance(self.embedding, OneHotEmbedding):
+            lengths = lengths + 2 * (self.embedding.ksize // 2)
+        x = self.encoder(x, lengths=lengths)
 
         if self.no_split_lr:
             x_l, x_r = x, x
@@ -290,9 +381,9 @@ class NeuralNet(nn.Module):
         if self.pair_join != 'bilinear':
             x_lr = self.transform2d(x_l, x_r)
 
-            score_paired = self.fc_paired(x_lr)
+            score_paired = self.fc_paired(x_lr, lengths=lengths)
             if self.fc_unpaired is not None:
-                score_unpaired = self.fc_unpaired(x)
+                score_unpaired = self.fc_unpaired(x, lengths=lengths)
             else:
                 score_unpaired = None
 
@@ -300,9 +391,9 @@ class NeuralNet(nn.Module):
 
         else:
             B, N, C = x_l.shape
-            x_l = x_l.view(B, N, 1, C).expand(B, N, N, C).reshape(B*N*N, -1)
-            x_r = x_r.view(B, 1, N, C).expand(B, N, N, C).reshape(B*N*N, -1)
-            score_paired = self.bilinear(x_l, x_r).view(B, N, N, -1)
+            x_l = x_l.reshape(B, N, 1, C).expand(B, N, N, C).reshape(B*N*N, -1)
+            x_r = x_r.reshape(B, 1, N, C).expand(B, N, N, C).reshape(B*N*N, -1)
+            score_paired = self.bilinear(x_l, x_r).reshape(B, N, N, -1)
             score_unpaired = self.linear(x)
 
             return score_paired, score_unpaired
